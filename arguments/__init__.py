@@ -102,6 +102,11 @@ class OptimizationParams(ParamGroup):
         self.normal_lr = 0.0025
         self.env_lr = 0.001
         self.env_dc_weight = 0.01
+        self.enable_chroma_consistency = False
+        self.chroma_lambda = 0.01
+        self.chroma_start_iter = 3000
+        self.chroma_sample_freq = 2
+        self.chroma_depth_threshold = 0.01
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
