@@ -103,10 +103,13 @@ class OptimizationParams(ParamGroup):
         self.env_lr = 0.001
         self.env_dc_weight = 0.01
         self.enable_chroma_consistency = False
-        self.chroma_lambda = 0.01
-        self.chroma_start_iter = 3000
-        self.chroma_sample_freq = 2
-        self.chroma_depth_threshold = 0.01
+        self.chroma_lambda = 0.05  # 提升到0.05（原0.01）
+        self.chroma_start_iter = 1500  # 提前到1500（原3000）
+        self.chroma_sample_freq = 5  # 降低到每5次（原2次），减少开销
+        self.chroma_depth_threshold = 0.03  # 放宽到0.03（原0.01）
+        self.chroma_use_patch = True  # 新增：使用patch采样
+        self.chroma_patch_size = 64  # 新增：patch大小
+        self.albedo_smooth_weight = 0.001  # 新增：反照率平滑正则化
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

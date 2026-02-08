@@ -69,9 +69,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     # ⭐ 多视角色度一致性初始化
     if opt.enable_chroma_consistency:
-        from utils.chroma_utils import compute_chroma_consistency_loss
+        from utils.chroma_utils import compute_chroma_consistency_loss_optimized, compute_albedo_smoothness_loss
         print(f"✅ Multi-view Chromaticity Consistency enabled (lambda={opt.chroma_lambda}, "
               f"start_iter={opt.chroma_start_iter}, sample_freq={opt.chroma_sample_freq})")
+        print(f"   Optimizations: patch_sampling={opt.chroma_use_patch}, patch_size={opt.chroma_patch_size}")
+        print(f"   Albedo smoothness: weight={opt.albedo_smooth_weight}")
         ema_chroma_for_log = 0.0
         ema_valid_ratio_for_log = 0.0
 
@@ -163,8 +165,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        # ⭐ Multi-view Chromaticity Consistency Loss
-        loss_chroma = 0.0
+        # ⭐ Multi-view Chromaticity Consistency Loss (优化版)
+        loss_chroma = None
         valid_ratio = 0.0
         if opt.enable_chroma_consistency and iteration >= opt.chroma_start_iter:
             # 每 chroma_sample_freq 次迭代采样一次
@@ -177,18 +179,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if len(other_cameras) > 0:
                         viewpoint_cam_tgt = other_cameras[randint(0, len(other_cameras) - 1)]
                         
-                        # 计算色度一致性损失
-                        loss_chroma, valid_ratio = compute_chroma_consistency_loss(
+                        # 计算色度一致性损失（优化版）
+                        loss_chroma, valid_ratio = compute_chroma_consistency_loss_optimized(
                             camera_src=viewpoint_cam,
                             camera_tgt=viewpoint_cam_tgt,
                             gaussians=gaussians,
                             pipe=pipe,
                             background=background,
-                            depth_threshold=opt.chroma_depth_threshold
+                            depth_threshold=opt.chroma_depth_threshold,
+                            use_patch=opt.chroma_use_patch,
+                            patch_size=opt.chroma_patch_size
                         )
                         
                         # 加入总损失
-                        loss += opt.chroma_lambda * loss_chroma
+                        if loss_chroma > 0:
+                            loss += opt.chroma_lambda * loss_chroma
+            
+            # ⭐ 反照率平滑正则化（每10次迭代计算一次，进一步降低开销）
+            if iteration % (opt.chroma_sample_freq * 2) == 0:
+                loss_albedo_smooth = compute_albedo_smoothness_loss(gaussians)
+                loss += opt.albedo_smooth_weight * loss_albedo_smooth
 
         loss.backward()
 
@@ -199,9 +209,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
-            # ⭐ 更新色度一致性EMA
+            # ⭐ 更新色度一致性EMA（只在实际计算时更新）
             if opt.enable_chroma_consistency and iteration >= opt.chroma_start_iter:
-                if isinstance(loss_chroma, torch.Tensor):
+                if loss_chroma is not None and isinstance(loss_chroma, torch.Tensor):
                     ema_chroma_for_log = 0.4 * loss_chroma.item() + 0.6 * ema_chroma_for_log
                     ema_valid_ratio_for_log = 0.4 * valid_ratio + 0.6 * ema_valid_ratio_for_log
 
