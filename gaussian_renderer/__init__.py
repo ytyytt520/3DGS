@@ -15,14 +15,14 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, render_diffuse_only=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, iteration=None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     
     Args:
-        render_diffuse_only: If True, only render diffuse color (no residual)
+        iteration: current training iteration (for residual weight scheduling)
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -81,18 +81,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         diffuse_light = torch.relu(eval_sh(2, env_sh, normals))
         diffuse_color = pc.get_albedo * diffuse_light
 
-        # If render_diffuse_only, skip residual color
-        if render_diffuse_only:
-            colors_precomp = torch.clamp(diffuse_color, 0.0, 1.0)
+        residual_color = 0.0
+        if not pipe.diffuse_only:
+            num_pts = pc.get_xyz.shape[0]
+            view_dirs = pc.get_xyz - viewpoint_camera.camera_center.repeat(num_pts, 1)
+            view_dirs = view_dirs / (view_dirs.norm(dim=1, keepdim=True) + 1e-9)
+            residual_sh = torch.cat((torch.zeros_like(pc.get_features_dc), pc.get_features_rest), dim=1).transpose(1, 2)
+            residual_color = eval_sh(pc.active_sh_degree, residual_sh, view_dirs)
+        
+        # Apply residual weight scheduling (Phase 1)
+        if iteration is not None:
+            from utils.regularization_utils import get_residual_weight
+            residual_weight = get_residual_weight(iteration)
         else:
-            residual_color = 0.0
-            if not pipe.diffuse_only:
-                num_pts = pc.get_xyz.shape[0]
-                view_dirs = pc.get_xyz - viewpoint_camera.camera_center.repeat(num_pts, 1)
-                view_dirs = view_dirs / (view_dirs.norm(dim=1, keepdim=True) + 1e-9)
-                residual_sh = torch.cat((torch.zeros_like(pc.get_features_dc), pc.get_features_rest), dim=1).transpose(1, 2)
-                residual_color = eval_sh(pc.active_sh_degree, residual_sh, view_dirs)
-            colors_precomp = torch.clamp(diffuse_color + residual_color, 0.0, 1.0)
+            residual_weight = 1.0  # Full residual during inference
+        
+        colors_precomp = torch.clamp(diffuse_color + residual_weight * residual_color, 0.0, 1.0)
     else:
         colors_precomp = override_color
 
@@ -120,7 +124,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             cov3D_precomp = cov3D_precomp)
         
     # Apply exposure to rendered image (training only)
-    if use_trained_exp and not render_diffuse_only:
+    if use_trained_exp:
         exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
         rendered_image = torch.matmul(rendered_image.permute(1, 2, 0), exposure[:3, :3]).permute(2, 0, 1) + exposure[:3, 3,   None, None]
 

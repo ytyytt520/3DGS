@@ -22,6 +22,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.regularization_utils import albedo_smooth_loss, residual_energy_loss, get_residual_weight
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -66,16 +67,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
-
-    # ⭐ 多视角色度一致性初始化
-    if opt.enable_chroma_consistency:
-        from utils.chroma_utils import compute_chroma_consistency_loss_optimized, compute_albedo_smoothness_loss
-        print(f"✅ Multi-view Chromaticity Consistency enabled (lambda={opt.chroma_lambda}, "
-              f"start_iter={opt.chroma_start_iter}, sample_freq={opt.chroma_sample_freq})")
-        print(f"   Optimizations: patch_sampling={opt.chroma_use_patch}, patch_size={opt.chroma_patch_size}")
-        print(f"   Albedo smoothness: weight={opt.albedo_smooth_weight}")
-        ema_chroma_for_log = 0.0
-        ema_valid_ratio_for_log = 0.0
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -129,7 +120,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         #5.高斯点云光栅化渲染
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, iteration=iteration)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -165,40 +156,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        # ⭐ Multi-view Chromaticity Consistency Loss (优化版)
-        loss_chroma = None
-        valid_ratio = 0.0
-        if opt.enable_chroma_consistency and iteration >= opt.chroma_start_iter:
-            # 每 chroma_sample_freq 次迭代采样一次
-            if iteration % opt.chroma_sample_freq == 0:
-                # 随机选择另一个相机作为副视角
-                train_cameras = scene.getTrainCameras()
-                if len(train_cameras) > 1:
-                    # 确保不选到同一个相机
-                    other_cameras = [cam for cam in train_cameras if cam.image_name != viewpoint_cam.image_name]
-                    if len(other_cameras) > 0:
-                        viewpoint_cam_tgt = other_cameras[randint(0, len(other_cameras) - 1)]
-                        
-                        # 计算色度一致性损失（优化版）
-                        loss_chroma, valid_ratio = compute_chroma_consistency_loss_optimized(
-                            camera_src=viewpoint_cam,
-                            camera_tgt=viewpoint_cam_tgt,
-                            gaussians=gaussians,
-                            pipe=pipe,
-                            background=background,
-                            depth_threshold=opt.chroma_depth_threshold,
-                            use_patch=opt.chroma_use_patch,
-                            patch_size=opt.chroma_patch_size
-                        )
-                        
-                        # 加入总损失
-                        if loss_chroma > 0:
-                            loss += opt.chroma_lambda * loss_chroma
-            
-            # ⭐ 反照率平滑正则化（每10次迭代计算一次，进一步降低开销）
-            if iteration % (opt.chroma_sample_freq * 2) == 0:
-                loss_albedo_smooth = compute_albedo_smoothness_loss(gaussians)
-                loss += opt.albedo_smooth_weight * loss_albedo_smooth
+        # Phase 1 & 2: Regularization losses
+        # Albedo smoothness (start after initial warm-up)
+        if iteration > 500:
+            loss_albedo_smooth = albedo_smooth_loss(
+                gaussians,
+                k=opt.albedo_smooth_k,
+                weight=opt.albedo_smooth_weight,
+                sample_size=4096
+            )
+            loss += loss_albedo_smooth
+        
+        # Residual energy regularization (start after diffuse is learned)
+        if iteration > 1000:
+            loss_residual_energy = residual_energy_loss(
+                gaussians,
+                weight=opt.residual_energy_weight,
+                threshold=0.1
+            )
+            loss += loss_residual_energy
 
         loss.backward()
 
@@ -209,18 +185,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
-            # ⭐ 更新色度一致性EMA（只在实际计算时更新）
-            if opt.enable_chroma_consistency and iteration >= opt.chroma_start_iter:
-                if loss_chroma is not None and isinstance(loss_chroma, torch.Tensor):
-                    ema_chroma_for_log = 0.4 * loss_chroma.item() + 0.6 * ema_chroma_for_log
-                    ema_valid_ratio_for_log = 0.4 * valid_ratio + 0.6 * ema_valid_ratio_for_log
-
             if iteration % 10 == 0:
-                postfix_dict = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
-                if opt.enable_chroma_consistency and iteration >= opt.chroma_start_iter:
-                    postfix_dict["Chroma Loss"] = f"{ema_chroma_for_log:.{7}f}"
-                    postfix_dict["Valid Ratio"] = f"{ema_valid_ratio_for_log:.{3}f}"
-                progress_bar.set_postfix(postfix_dict)
+                residual_weight = get_residual_weight(iteration, opt.residual_warmup_start, opt.residual_warmup_end)
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{7}f}", 
+                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
+                    "Res Weight": f"{residual_weight:.3f}"
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
