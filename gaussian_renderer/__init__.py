@@ -85,14 +85,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         if render_diffuse_only:
             colors_precomp = torch.clamp(diffuse_color, 0.0, 1.0)
         else:
-        residual_color = 0.0
-        if not pipe.diffuse_only:
-            num_pts = pc.get_xyz.shape[0]
-            view_dirs = pc.get_xyz - viewpoint_camera.camera_center.repeat(num_pts, 1)
-            view_dirs = view_dirs / (view_dirs.norm(dim=1, keepdim=True) + 1e-9)
-            residual_sh = torch.cat((torch.zeros_like(pc.get_features_dc), pc.get_features_rest), dim=1).transpose(1, 2)
-            residual_color = eval_sh(pc.active_sh_degree, residual_sh, view_dirs)
-        colors_precomp = torch.clamp(diffuse_color + residual_color, 0.0, 1.0)
+            residual_color = 0.0
+            if not pipe.diffuse_only:
+                num_pts = pc.get_xyz.shape[0]
+                view_dirs = pc.get_xyz - viewpoint_camera.camera_center.repeat(num_pts, 1)
+                view_dirs = view_dirs / (view_dirs.norm(dim=1, keepdim=True) + 1e-9)
+                residual_sh = torch.cat((torch.zeros_like(pc.get_features_dc), pc.get_features_rest), dim=1).transpose(1, 2)
+                residual_color = eval_sh(pc.active_sh_degree, residual_sh, view_dirs)
+            colors_precomp = torch.clamp(diffuse_color + residual_color, 0.0, 1.0)
     else:
         colors_precomp = override_color
 
