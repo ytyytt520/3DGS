@@ -13,14 +13,14 @@ import torch
 from simple_knn._C import distCUDA2
 
 
-def albedo_smooth_loss(gaussians, k=16, weight=0.01, sample_size=2048):
+def albedo_smooth_loss(gaussians, k=16, weight=0.01, sample_size=1024):
     """
-    Albedo 3D spatial smoothness regularization.
+    Albedo 3D spatial smoothness regularization (Memory-efficient version).
     Encourages neighboring Gaussians to have similar albedo values.
     
     Args:
         gaussians: GaussianModel instance
-        k: number of nearest neighbors (not used in simplified version)
+        k: number of nearest neighbors to use for smoothing
         weight: loss weight
         sample_size: number of points to sample for efficiency
     
@@ -34,8 +34,8 @@ def albedo_smooth_loss(gaussians, k=16, weight=0.01, sample_size=2048):
     if N == 0:
         return torch.tensor(0.0, device="cuda")
     
-    # Reduce sample size to avoid OOM
-    actual_sample_size = min(sample_size, N, 2048)
+    # Use very small sample size to avoid OOM
+    actual_sample_size = min(sample_size, N, 512)
     
     # Random sampling for efficiency
     if N > actual_sample_size:
@@ -47,43 +47,52 @@ def albedo_smooth_loss(gaussians, k=16, weight=0.01, sample_size=2048):
         albedo_sample = albedo
         actual_sample_size = N
     
-    # Compute average nearest neighbor distance for radius estimation
+    # Use KNN-based approach instead of radius-based to save memory
     try:
-        dists_sq = distCUDA2(xyz_sample)  # (actual_sample_size,) squared distances to nearest neighbor
-        dists = torch.sqrt(torch.clamp(dists_sq, min=1e-8))
-        radius = dists.mean() * 2.0  # Use 2x average nearest neighbor distance
-    except:
-        # Fallback if KNN fails
-        radius = 0.1
-    
-    # Memory-efficient neighborhood computation using chunking
-    chunk_size = 512  # Process in smaller chunks to avoid OOM
-    loss_sum = 0.0
-    total_samples = 0
-    
-    for i in range(0, actual_sample_size, chunk_size):
-        end_idx = min(i + chunk_size, actual_sample_size)
-        xyz_chunk = xyz_sample[i:end_idx]
-        albedo_chunk = albedo_sample[i:end_idx]
+        # Compute k nearest neighbors for each sampled point
+        from simple_knn._C import distCUDA2
         
-        # Compute pairwise distances for this chunk
-        dist_matrix = torch.cdist(xyz_chunk, xyz)  # (chunk_size, N)
-        neighbor_mask = dist_matrix < radius  # (chunk_size, N)
+        # Process in very small chunks to avoid OOM
+        chunk_size = 128  # Very small chunks
+        loss_sum = 0.0
+        total_samples = 0
         
-        # Compute neighborhood average albedo
-        neighbor_counts = neighbor_mask.sum(dim=1, keepdim=True).clamp(min=1)  # (chunk_size, 1)
-        neighbor_albedo_sum = torch.matmul(neighbor_mask.float(), albedo)  # (chunk_size, 3)
-        albedo_mean = neighbor_albedo_sum / neighbor_counts  # (chunk_size, 3)
+        for i in range(0, actual_sample_size, chunk_size):
+            end_idx = min(i + chunk_size, actual_sample_size)
+            xyz_chunk = xyz_sample[i:end_idx]
+            albedo_chunk = albedo_sample[i:end_idx]
+            chunk_len = end_idx - i
+            
+            # Compute distances to all points for this small chunk
+            # Use CPU for distance computation if GPU memory is tight
+            with torch.no_grad():
+                dist_matrix = torch.cdist(xyz_chunk, xyz)  # (chunk_len, N)
+                
+                # Get k nearest neighbors
+                k_actual = min(k, N)
+                _, knn_indices = torch.topk(dist_matrix, k_actual, dim=1, largest=False)  # (chunk_len, k)
+                
+                # Gather albedo values of k nearest neighbors
+                knn_albedo = albedo[knn_indices.view(-1)].view(chunk_len, k_actual, 3)  # (chunk_len, k, 3)
+                
+                # Compute mean albedo of neighbors
+                albedo_mean = knn_albedo.mean(dim=1)  # (chunk_len, 3)
+            
+            # L1 smoothness loss for this chunk
+            chunk_loss = torch.abs(albedo_chunk - albedo_mean).sum()
+            loss_sum += chunk_loss
+            total_samples += chunk_len
+            
+            # Free memory immediately
+            del dist_matrix, knn_indices, knn_albedo, albedo_mean
+            torch.cuda.empty_cache()
         
-        # L1 smoothness loss for this chunk
-        chunk_loss = torch.abs(albedo_chunk - albedo_mean).sum()
-        loss_sum += chunk_loss
-        total_samples += (end_idx - i)
+        loss = loss_sum / (total_samples * 3)  # Average over all samples and channels
         
-        # Free memory
-        del dist_matrix, neighbor_mask, neighbor_counts, neighbor_albedo_sum, albedo_mean
-    
-    loss = loss_sum / (total_samples * 3)  # Average over all samples and channels
+    except Exception as e:
+        # Fallback: simple L2 regularization on albedo if KNN fails
+        print(f"Warning: albedo_smooth_loss failed ({e}), using simple regularization")
+        loss = torch.mean(albedo ** 2) * 0.01
     
     return weight * loss
 

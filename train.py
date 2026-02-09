@@ -157,15 +157,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
 
         # Phase 1 & 2: Regularization losses
-        # Albedo smoothness (start after initial warm-up)
-        if iteration > 500:
-            loss_albedo_smooth = albedo_smooth_loss(
-                gaussians,
-                k=opt.albedo_smooth_k,
-                weight=opt.albedo_smooth_weight,
-                sample_size=4096
-            )
-            loss += loss_albedo_smooth
+        # Albedo smoothness (start after initial warm-up, compute every 10 iterations to save memory)
+        if iteration > 500 and iteration % 10 == 0:
+            try:
+                loss_albedo_smooth = albedo_smooth_loss(
+                    gaussians,
+                    k=opt.albedo_smooth_k,
+                    weight=opt.albedo_smooth_weight,
+                    sample_size=512  # Reduced from 4096 to 512
+                )
+                loss += loss_albedo_smooth
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\n[WARNING] Albedo smooth loss OOM at iter {iteration}, skipping...")
+                    torch.cuda.empty_cache()
+                else:
+                    raise e
         
         # Residual energy regularization (start after diffuse is learned)
         if iteration > 1000:
