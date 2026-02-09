@@ -64,8 +64,18 @@ class GaussianModel:
         self._rotation = torch.empty(0) #旋转向量
         self._opacity = torch.empty(0) #不透明度
         self._env_sh = torch.empty(0)
-        self.env_sh_degree = 2
+        self.env_sh_degree = 4  # ⭐ 提高到4阶（25个系数）
         self.env_sh_dc_anchor = 1.0 / C0
+        
+        # ⭐ 新增：物理材质参数
+        self._roughness = torch.empty(0)  # 粗糙度
+        self._metallic = torch.empty(0)   # 金属度
+        
+        # ⭐ 新增：空间变化环境光（光探针）
+        self.num_probes = 16  # 探针数量
+        self.probe_positions = torch.empty(0)  # 探针位置
+        self.probe_env_sh = torch.empty(0)     # 每个探针的环境光
+        
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -173,6 +183,16 @@ class GaussianModel:
     @property
     def get_env_sh(self):
         return self._env_sh
+    
+    @property
+    def get_roughness(self):
+        """粗糙度：sigmoid激活到[0,1]"""
+        return self.opacity_activation(self._roughness)
+    
+    @property
+    def get_metallic(self):
+        """金属度：sigmoid激活到[0,1]"""
+        return self.opacity_activation(self._metallic)
 
     @property
     def get_opacity(self):
@@ -196,9 +216,71 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def init_env_sh(self, device):
+        """初始化全局环境光（用于兼容性，实际使用探针）"""
         env = torch.zeros((1, 3, (self.env_sh_degree + 1) ** 2), device=device, dtype=torch.float)
         env[..., 0] = self.env_sh_dc_anchor
         return nn.Parameter(env.requires_grad_(True))
+    
+    def init_light_probes(self, scene_bounds, device):
+        """
+        ⭐ 初始化空间变化的环境光探针
+        
+        参数:
+            scene_bounds: (min_xyz, max_xyz) 场景边界
+            device: 设备
+        """
+        min_xyz, max_xyz = scene_bounds
+        
+        # 在3D网格中均匀放置探针
+        grid_size = int(np.ceil(self.num_probes ** (1/3)))  # 16 -> 3x3x3
+        
+        x = torch.linspace(min_xyz[0].item(), max_xyz[0].item(), grid_size, device=device)
+        y = torch.linspace(min_xyz[1].item(), max_xyz[1].item(), grid_size, device=device)
+        z = torch.linspace(min_xyz[2].item(), max_xyz[2].item(), grid_size, device=device)
+        
+        grid_x, grid_y, grid_z = torch.meshgrid(x, y, z, indexing='ij')
+        
+        positions = torch.stack([
+            grid_x.flatten(),
+            grid_y.flatten(),
+            grid_z.flatten()
+        ], dim=-1)[:self.num_probes]  # (num_probes, 3)
+        
+        self.probe_positions = nn.Parameter(positions)
+        
+        # 初始化每个探针的环境光为均匀白光
+        num_coeffs = (self.env_sh_degree + 1) ** 2  # 4阶 = 25个系数
+        probe_env = torch.zeros((self.num_probes, 3, num_coeffs), device=device, dtype=torch.float)
+        probe_env[:, :, 0] = self.env_sh_dc_anchor  # DC分量
+        
+        self.probe_env_sh = nn.Parameter(probe_env)
+        
+        print(f"✅ 初始化 {self.num_probes} 个环境光探针，每个探针 {num_coeffs} 个球谐系数")
+    
+    def get_spatially_varying_env(self, positions):
+        """
+        ⭐ 获取空间变化的环境光
+        
+        参数:
+            positions: (N, 3) 查询位置
+        返回:
+            env_sh: (N, 3, 25) 每个位置的环境光球谐系数
+        """
+        N = positions.shape[0]
+        K = self.num_probes
+        
+        # 计算每个点到所有探针的距离
+        distances = torch.cdist(positions, self.probe_positions)  # (N, K)
+        
+        # 使用RBF插值（径向基函数）
+        sigma = (self.probe_positions.max() - self.probe_positions.min()) / 4.0  # 自适应sigma
+        weights = torch.exp(-distances ** 2 / (2 * sigma ** 2 + 1e-8))  # (N, K)
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)  # 归一化
+        
+        # 加权求和
+        env_sh = torch.einsum('nk,kcd->ncd', weights, self.probe_env_sh)  # (N, 3, 25)
+        
+        return env_sh
 
     def load_env_sh_tensor(self, env_tensor):
         device = self._xyz.device if self._xyz.numel() > 0 else env_tensor.device
@@ -246,7 +328,24 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        
+        # ⭐ 初始化粗糙度（默认0.5，中等粗糙）
+        roughness_init = self.inverse_opacity_activation(0.5 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        self._roughness = nn.Parameter(roughness_init.requires_grad_(True))
+        
+        # ⭐ 初始化金属度（默认0.1，大部分是非金属）
+        metallic_init = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        self._metallic = nn.Parameter(metallic_init.requires_grad_(True))
+        
+        # ⭐ 初始化空间变化环境光探针
+        # 计算场景边界
+        min_xyz = fused_point_cloud.min(dim=0)[0]
+        max_xyz = fused_point_cloud.max(dim=0)[0]
+        self.init_light_probes((min_xyz, max_xyz), "cuda")
+        
+        # 保留全局环境光用于兼容性
         self._env_sh = self.init_env_sh("cuda")
+        
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
@@ -267,7 +366,13 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._env_sh], 'lr': training_args.env_lr, "name": "env_sh"}
+            {'params': [self._env_sh], 'lr': training_args.env_lr, "name": "env_sh"},
+            # ⭐ 新增：物理材质参数
+            {'params': [self._roughness], 'lr': training_args.roughness_lr, "name": "roughness"},
+            {'params': [self._metallic], 'lr': training_args.metallic_lr, "name": "metallic"},
+            # ⭐ 新增：光探针参数
+            {'params': [self.probe_positions], 'lr': training_args.probe_lr, "name": "probe_pos"},
+            {'params': [self.probe_env_sh], 'lr': training_args.env_lr, "name": "probe_env"}
         ]
 
         if self.optimizer_type == "default":
@@ -433,7 +538,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] not in ["xyz", "f_dc", "f_rest", "albedo", "normal", "opacity", "scaling", "rotation"]:
+            if group["name"] not in ["xyz", "f_dc", "f_rest", "albedo", "normal", "opacity", "scaling", "rotation", "roughness", "metallic"]:
                 optimizable_tensors[group["name"]] = group["params"][0]
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -463,6 +568,12 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        
+        # ⭐ 剪枝材质参数
+        if "roughness" in optimizable_tensors:
+            self._roughness = optimizable_tensors["roughness"]
+        if "metallic" in optimizable_tensors:
+            self._metallic = optimizable_tensors["metallic"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -542,8 +653,16 @@ class GaussianModel:
         new_normal = self._normal[selected_pts_mask].repeat(N,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        
+        # ⭐ 复制材质参数
+        new_roughness = self._roughness[selected_pts_mask].repeat(N,1)
+        new_metallic = self._metallic[selected_pts_mask].repeat(N,1)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_albedo, new_normal, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        
+        # ⭐ 手动添加材质参数（因为densification_postfix不包含它们）
+        self._roughness = torch.cat([self._roughness, new_roughness], dim=0)
+        self._metallic = torch.cat([self._metallic, new_metallic], dim=0)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -562,10 +681,17 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        
+        # ⭐ 克隆材质参数
+        new_roughness = self._roughness[selected_pts_mask]
+        new_metallic = self._metallic[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_albedo, new_normal, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        
+        # ⭐ 手动添加材质参数
+        self._roughness = torch.cat([self._roughness, new_roughness], dim=0)
+        self._metallic = torch.cat([self._metallic, new_metallic], dim=0)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom

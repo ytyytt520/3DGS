@@ -1,4 +1,4 @@
-﻿#
+#
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
@@ -102,14 +102,12 @@ class OptimizationParams(ParamGroup):
         self.normal_lr = 0.0025
         self.env_lr = 0.001
         self.env_dc_weight = 0.01
-        
-        # Phase 1 & 2: Regularization parameters
-        self.albedo_smooth_weight = 0.01
-        self.albedo_smooth_k = 16
-        self.residual_energy_weight = 0.001
-        self.residual_warmup_start = 5000
-        self.residual_warmup_end = 15000
-        
+        self.roughness_lr = 0.005
+        self.metallic_lr = 0.005
+        self.probe_lr = 0.0001
+        self.roughness_smooth_weight = 0.01
+        self.metallic_binary_weight = 0.01
+        self.probe_smooth_weight = 0.01
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

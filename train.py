@@ -22,7 +22,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.regularization_utils import albedo_smooth_loss, residual_energy_loss, get_residual_weight
+from utils.pbr_utils import compute_material_regularization  # ⭐ 导入材质正则化
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -120,7 +120,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         #5.高斯点云光栅化渲染
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, iteration=iteration)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -137,10 +137,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        
+        # ⭐ 环境光DC正则化
         env_dc = gaussians.get_env_sh[..., 0]
         env_anchor = torch.tensor(gaussians.env_sh_dc_anchor, device=env_dc.device, dtype=env_dc.dtype)
         env_dc_loss = opt.env_dc_weight * torch.mean((env_dc - env_anchor) ** 2)
         loss += env_dc_loss
+        
+        # ⭐ 材质正则化损失
+        material_losses = compute_material_regularization(gaussians, opt)
+        loss_roughness_smooth = material_losses['roughness_smooth']
+        loss_metallic_binary = material_losses['metallic_binary']
+        loss_probe_smooth = material_losses['probe_smooth']
+        
+        loss += loss_roughness_smooth + loss_metallic_binary + loss_probe_smooth
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -156,33 +166,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        # Phase 1 & 2: Regularization losses
-        # Albedo smoothness (start after initial warm-up, compute every 10 iterations to save memory)
-        if iteration > 500 and iteration % 10 == 0:
-            try:
-                loss_albedo_smooth = albedo_smooth_loss(
-                    gaussians,
-                    k=opt.albedo_smooth_k,
-                    weight=opt.albedo_smooth_weight,
-                    sample_size=512  # Reduced from 4096 to 512
-                )
-                loss += loss_albedo_smooth
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"\n[WARNING] Albedo smooth loss OOM at iter {iteration}, skipping...")
-                    torch.cuda.empty_cache()
-                else:
-                    raise e
-        
-        # Residual energy regularization (start after diffuse is learned)
-        if iteration > 1000:
-            loss_residual_energy = residual_energy_loss(
-                gaussians,
-                weight=opt.residual_energy_weight,
-                threshold=0.1
-            )
-            loss += loss_residual_energy
-
         loss.backward()
 
         iter_end.record()
@@ -193,12 +176,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                residual_weight = get_residual_weight(iteration, opt.residual_warmup_start, opt.residual_warmup_end)
-                progress_bar.set_postfix({
-                    "Loss": f"{ema_loss_for_log:.{7}f}", 
-                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
-                    "Res Weight": f"{residual_weight:.3f}"
-                })
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()

@@ -14,15 +14,13 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.pbr_utils import cook_torrance_brdf, get_dominant_light_direction, sample_env_for_specular
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, iteration=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
-    
-    Args:
-        iteration: current training iteration (for residual weight scheduling)
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -70,33 +68,74 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = pc.get_scaling
         rotations = pc.get_rotation
 
-    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    # ⭐ 物理渲染：计算颜色
     shs = None
     dc = None
     colors_precomp = None
     if override_color is None:
-        normals = pc.get_normal
-        env_sh = pc.get_env_sh.expand(pc.get_xyz.shape[0], -1, -1)
-        diffuse_light = torch.relu(eval_sh(2, env_sh, normals))
-        diffuse_color = pc.get_albedo * diffuse_light
-
-        residual_color = 0.0
+        num_pts = pc.get_xyz.shape[0]
+        
+        # ===== 1. 获取材质参数 =====
+        albedo = pc.get_albedo  # (N, 3)
+        normals = pc.get_normal  # (N, 3)
+        roughness = pc.get_roughness  # (N, 1)
+        metallic = pc.get_metallic  # (N, 1)
+        
+        # ===== 2. 获取空间变化的环境光 ⭐ =====
+        positions = pc.get_xyz  # (N, 3)
+        env_sh = pc.get_spatially_varying_env(positions)  # (N, 3, 25)
+        
+        # ===== 3. 计算漫反射 =====
+        diffuse_light = torch.relu(eval_sh(4, env_sh, normals))  # 使用4阶球谐
+        # 能量守恒：金属没有漫反射
+        diffuse_color = albedo * diffuse_light * (1.0 - metallic)  # (N, 3)
+        
+        # ===== 4. 计算镜面反射 ⭐ =====
+        specular_color = torch.zeros_like(albedo)
+        
         if not pipe.diffuse_only:
-            num_pts = pc.get_xyz.shape[0]
-            view_dirs = pc.get_xyz - viewpoint_camera.camera_center.repeat(num_pts, 1)
+            # 计算观察方向（从表面指向相机）
+            view_dirs = viewpoint_camera.camera_center.repeat(num_pts, 1) - pc.get_xyz
             view_dirs = view_dirs / (view_dirs.norm(dim=1, keepdim=True) + 1e-9)
+            
+            # 获取主光源方向
+            light_dirs = get_dominant_light_direction(env_sh)  # (N, 3)
+            
+            # 计算光照强度
+            light_intensity = torch.relu(eval_sh(4, env_sh, light_dirs))  # (N, 3)
+            
+            # Cook-Torrance BRDF
+            specular_direct = cook_torrance_brdf(
+                albedo=albedo,
+                normal=normals,
+                view_dir=view_dirs,
+                light_dir=light_dirs,
+                roughness=roughness,
+                metallic=metallic,
+                light_intensity=light_intensity
+            )  # (N, 3)
+            
+            # 环境镜面反射
+            reflect_dirs = 2.0 * torch.sum(view_dirs * normals, dim=-1, keepdim=True) * normals - view_dirs
+            reflect_dirs = reflect_dirs / (reflect_dirs.norm(dim=1, keepdim=True) + 1e-9)
+            env_specular = sample_env_for_specular(env_sh, reflect_dirs, roughness)  # (N, 3)
+            
+            # 菲涅尔加权
+            VdotN = torch.clamp(torch.sum(view_dirs * normals, dim=-1, keepdim=True), 0.0, 1.0)
+            F0 = torch.lerp(torch.full_like(albedo, 0.04), albedo, metallic)
+            F = F0 + (1.0 - F0) * torch.pow(1.0 - VdotN, 5.0)
+            
+            specular_env = F * env_specular
+            
+            specular_color = specular_direct + specular_env
+            
+            # ===== 5. 可选：球谐残差（处理极端情况） =====
             residual_sh = torch.cat((torch.zeros_like(pc.get_features_dc), pc.get_features_rest), dim=1).transpose(1, 2)
-            residual_color = eval_sh(pc.active_sh_degree, residual_sh, view_dirs)
+            residual_color = 0.1 * eval_sh(pc.active_sh_degree, residual_sh, view_dirs)  # 降低权重
+            specular_color = specular_color + residual_color
         
-        # Apply residual weight scheduling (Phase 1)
-        if iteration is not None:
-            from utils.regularization_utils import get_residual_weight
-            residual_weight = get_residual_weight(iteration)
-        else:
-            residual_weight = 1.0  # Full residual during inference
-        
-        colors_precomp = torch.clamp(diffuse_color + residual_weight * residual_color, 0.0, 1.0)
+        # ===== 6. 合成最终颜色 =====
+        colors_precomp = torch.clamp(diffuse_color + specular_color, 0.0, 1.0)
     else:
         colors_precomp = override_color
 
