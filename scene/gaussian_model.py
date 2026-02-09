@@ -621,7 +621,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_albedo, new_normal, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_albedo, new_normal, new_opacities, new_scaling, new_rotation, new_roughness, new_metallic, new_tmp_radii):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -629,7 +629,9 @@ class GaussianModel:
         "normal": new_normal,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation}
+        "rotation" : new_rotation,
+        "roughness": new_roughness,
+        "metallic": new_metallic}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -640,6 +642,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._roughness = optimizable_tensors["roughness"]
+        self._metallic = optimizable_tensors["metallic"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -673,11 +677,7 @@ class GaussianModel:
         new_roughness = self._roughness[selected_pts_mask].repeat(N,1)
         new_metallic = self._metallic[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_albedo, new_normal, new_opacity, new_scaling, new_rotation, new_tmp_radii)
-        
-        # ⭐ 手动添加材质参数（因为densification_postfix不包含它们）
-        self._roughness = torch.cat([self._roughness, new_roughness], dim=0)
-        self._metallic = torch.cat([self._metallic, new_metallic], dim=0)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_albedo, new_normal, new_opacity, new_scaling, new_rotation, new_roughness, new_metallic, new_tmp_radii)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -702,11 +702,7 @@ class GaussianModel:
         new_roughness = self._roughness[selected_pts_mask]
         new_metallic = self._metallic[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_albedo, new_normal, new_opacities, new_scaling, new_rotation, new_tmp_radii)
-        
-        # ⭐ 手动添加材质参数
-        self._roughness = torch.cat([self._roughness, new_roughness], dim=0)
-        self._metallic = torch.cat([self._metallic, new_metallic], dim=0)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_albedo, new_normal, new_opacities, new_scaling, new_rotation, new_roughness, new_metallic, new_tmp_radii)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
