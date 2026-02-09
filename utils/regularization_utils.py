@@ -13,7 +13,7 @@ import torch
 from simple_knn._C import distCUDA2
 
 
-def albedo_smooth_loss(gaussians, k=16, weight=0.01, sample_size=4096):
+def albedo_smooth_loss(gaussians, k=16, weight=0.01, sample_size=2048):
     """
     Albedo 3D spatial smoothness regularization.
     Encourages neighboring Gaussians to have similar albedo values.
@@ -34,36 +34,56 @@ def albedo_smooth_loss(gaussians, k=16, weight=0.01, sample_size=4096):
     if N == 0:
         return torch.tensor(0.0, device="cuda")
     
+    # Reduce sample size to avoid OOM
+    actual_sample_size = min(sample_size, N, 2048)
+    
     # Random sampling for efficiency
-    if N > sample_size:
-        indices = torch.randperm(N, device=xyz.device)[:sample_size]
+    if N > actual_sample_size:
+        indices = torch.randperm(N, device=xyz.device)[:actual_sample_size]
         xyz_sample = xyz[indices]
         albedo_sample = albedo[indices]
     else:
         xyz_sample = xyz
         albedo_sample = albedo
-        sample_size = N
+        actual_sample_size = N
     
     # Compute average nearest neighbor distance for radius estimation
     try:
-        dists_sq = distCUDA2(xyz_sample)  # (sample_size,) squared distances to nearest neighbor
+        dists_sq = distCUDA2(xyz_sample)  # (actual_sample_size,) squared distances to nearest neighbor
         dists = torch.sqrt(torch.clamp(dists_sq, min=1e-8))
         radius = dists.mean() * 2.0  # Use 2x average nearest neighbor distance
     except:
         # Fallback if KNN fails
         radius = 0.1
     
-    # Compute pairwise distances
-    dist_matrix = torch.cdist(xyz_sample, xyz)  # (sample_size, N)
-    neighbor_mask = dist_matrix < radius  # (sample_size, N)
+    # Memory-efficient neighborhood computation using chunking
+    chunk_size = 512  # Process in smaller chunks to avoid OOM
+    loss_sum = 0.0
+    total_samples = 0
     
-    # Compute neighborhood average albedo
-    neighbor_counts = neighbor_mask.sum(dim=1, keepdim=True).clamp(min=1)  # (sample_size, 1)
-    neighbor_albedo_sum = torch.matmul(neighbor_mask.float(), albedo)  # (sample_size, 3)
-    albedo_mean = neighbor_albedo_sum / neighbor_counts  # (sample_size, 3)
+    for i in range(0, actual_sample_size, chunk_size):
+        end_idx = min(i + chunk_size, actual_sample_size)
+        xyz_chunk = xyz_sample[i:end_idx]
+        albedo_chunk = albedo_sample[i:end_idx]
+        
+        # Compute pairwise distances for this chunk
+        dist_matrix = torch.cdist(xyz_chunk, xyz)  # (chunk_size, N)
+        neighbor_mask = dist_matrix < radius  # (chunk_size, N)
+        
+        # Compute neighborhood average albedo
+        neighbor_counts = neighbor_mask.sum(dim=1, keepdim=True).clamp(min=1)  # (chunk_size, 1)
+        neighbor_albedo_sum = torch.matmul(neighbor_mask.float(), albedo)  # (chunk_size, 3)
+        albedo_mean = neighbor_albedo_sum / neighbor_counts  # (chunk_size, 3)
+        
+        # L1 smoothness loss for this chunk
+        chunk_loss = torch.abs(albedo_chunk - albedo_mean).sum()
+        loss_sum += chunk_loss
+        total_samples += (end_idx - i)
+        
+        # Free memory
+        del dist_matrix, neighbor_mask, neighbor_counts, neighbor_albedo_sum, albedo_mean
     
-    # L1 smoothness loss
-    loss = torch.abs(albedo_sample - albedo_mean).mean()
+    loss = loss_sum / (total_samples * 3)  # Average over all samples and channels
     
     return weight * loss
 
