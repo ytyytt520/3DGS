@@ -543,11 +543,26 @@ class GaussianModel:
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                # ⭐ 修复：对于不同形状的参数，正确应用mask
+                param = group["params"][0]
+                if param.ndim == 1:
+                    # 1D参数 (N,)
+                    stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                    new_param = param[mask]
+                elif param.ndim == 2 and param.shape[1] == 1:
+                    # 2D参数但第二维是1 (N, 1) - 如 opacity, roughness, metallic
+                    stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                    new_param = param[mask]
+                else:
+                    # 其他多维参数 (N, D)
+                    stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                    new_param = param[mask]
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                group["params"][0] = nn.Parameter(new_param.requires_grad_(True))
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
