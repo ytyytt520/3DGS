@@ -101,10 +101,17 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self._env_sh,
+            self._roughness,  # ⭐ 保存粗糙度
+            self._metallic,   # ⭐ 保存金属度
+            self.probe_positions,  # ⭐ 保存探针位置
+            self.probe_env_sh,     # ⭐ 保存探针环境光
         )
     
     def restore(self, model_args, training_args):
+        device = "cuda"
+        
         if len(model_args) < 15:
+            # 旧版本模型（不包含PBR参数）
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -122,7 +129,19 @@ class GaussianModel:
             self._albedo = nn.Parameter(self.inverse_opacity_activation(default_albedo).requires_grad_(True))
             self._normal = nn.Parameter(self._default_normals(device, self._xyz.shape[0]).requires_grad_(True))
             self._env_sh = self.init_env_sh(device)
-        else:
+            
+            # ⭐ 初始化PBR参数
+            num_points = self._xyz.shape[0]
+            self._roughness = nn.Parameter(self.inverse_opacity_activation(0.5 * torch.ones((num_points, 1), device=device)).requires_grad_(True))
+            self._metallic = nn.Parameter(self.inverse_opacity_activation(0.1 * torch.ones((num_points, 1), device=device)).requires_grad_(True))
+            
+            # 初始化探针
+            min_xyz = self._xyz.min(dim=0)[0]
+            max_xyz = self._xyz.max(dim=0)[0]
+            self.init_light_probes((min_xyz, max_xyz), device)
+            
+        elif len(model_args) < 19:
+            # 中间版本（包含albedo/normal但不包含PBR）
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -138,6 +157,41 @@ class GaussianModel:
             opt_dict, 
             self.spatial_lr_scale,
             self._env_sh) = model_args
+            
+            device = self._xyz.device
+            
+            # ⭐ 初始化PBR参数
+            num_points = self._xyz.shape[0]
+            self._roughness = nn.Parameter(self.inverse_opacity_activation(0.5 * torch.ones((num_points, 1), device=device)).requires_grad_(True))
+            self._metallic = nn.Parameter(self.inverse_opacity_activation(0.1 * torch.ones((num_points, 1), device=device)).requires_grad_(True))
+            
+            # 初始化探针
+            min_xyz = self._xyz.min(dim=0)[0]
+            max_xyz = self._xyz.max(dim=0)[0]
+            self.init_light_probes((min_xyz, max_xyz), device)
+            
+        else:
+            # ⭐ 新版本（完整PBR参数）
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._albedo,
+            self._normal,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self._env_sh,
+            self._roughness,
+            self._metallic,
+            self.probe_positions,
+            self.probe_env_sh) = model_args
+            
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
