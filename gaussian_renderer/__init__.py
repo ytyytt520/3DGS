@@ -83,10 +83,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         
         # ===== 2. 获取空间变化的环境光 ⭐ =====
         positions = pc.get_xyz  # (N, 3)
-        env_sh = pc.get_spatially_varying_env(positions)  # (N, 3, 25)
+        env_sh = pc.get_spatially_varying_env(positions)  # (N, 3, 9) ⭐ 降低到9系数
         
         # ===== 3. 计算漫反射 =====
-        diffuse_light = torch.relu(eval_sh(4, env_sh, normals))  # 使用4阶球谐
+        diffuse_light = torch.relu(eval_sh(2, env_sh, normals))  # ⭐ 使用2阶球谐（节省显存）
         # 能量守恒：金属没有漫反射
         diffuse_color = albedo * diffuse_light * (1.0 - metallic)  # (N, 3)
         
@@ -102,7 +102,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             light_dirs = get_dominant_light_direction(env_sh)  # (N, 3)
             
             # 计算光照强度
-            light_intensity = torch.relu(eval_sh(4, env_sh, light_dirs))  # (N, 3)
+            light_intensity = torch.relu(eval_sh(2, env_sh, light_dirs))  # ⭐ 使用2阶球谐
             
             # Cook-Torrance BRDF
             specular_direct = cook_torrance_brdf(
@@ -115,7 +115,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 light_intensity=light_intensity
             )  # (N, 3)
             
-            # 环境镜面反射
+            # 环境镜面反射（简化版，减少计算）
             reflect_dirs = 2.0 * torch.sum(view_dirs * normals, dim=-1, keepdim=True) * normals - view_dirs
             reflect_dirs = reflect_dirs / (reflect_dirs.norm(dim=1, keepdim=True) + 1e-9)
             env_specular = sample_env_for_specular(env_sh, reflect_dirs, roughness)  # (N, 3)
@@ -131,7 +131,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             
             # ===== 5. 可选：球谐残差（处理极端情况） =====
             residual_sh = torch.cat((torch.zeros_like(pc.get_features_dc), pc.get_features_rest), dim=1).transpose(1, 2)
-            residual_color = 0.1 * eval_sh(pc.active_sh_degree, residual_sh, view_dirs)  # 降低权重
+            residual_color = 0.05 * eval_sh(pc.active_sh_degree, residual_sh, view_dirs)  # ⭐ 进一步降低权重
             specular_color = specular_color + residual_color
         
         # ===== 6. 合成最终颜色 =====

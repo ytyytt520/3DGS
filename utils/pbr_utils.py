@@ -8,7 +8,7 @@ import math
 
 def cook_torrance_brdf(albedo, normal, view_dir, light_dir, roughness, metallic, light_intensity):
     """
-    Cook-Torrance BRDF模型
+    Cook-Torrance BRDF模型（优化版，减少中间张量）
     
     参数:
         albedo: (N, 3) 基础颜色/反照率
@@ -24,43 +24,37 @@ def cook_torrance_brdf(albedo, normal, view_dir, light_dir, roughness, metallic,
     """
     
     # ===== 1. 计算基础向量 =====
-    H = torch.nn.functional.normalize(view_dir + light_dir, dim=-1, eps=1e-6)  # 半程向量
+    H = torch.nn.functional.normalize(view_dir + light_dir, dim=-1, eps=1e-6)
     
     NdotH = torch.clamp(torch.sum(normal * H, dim=-1, keepdim=True), 0.0, 1.0)
     NdotV = torch.clamp(torch.sum(normal * view_dir, dim=-1, keepdim=True), 0.0, 1.0)
     NdotL = torch.clamp(torch.sum(normal * light_dir, dim=-1, keepdim=True), 0.0, 1.0)
     VdotH = torch.clamp(torch.sum(view_dir * H, dim=-1, keepdim=True), 0.0, 1.0)
     
-    # ===== 2. 法线分布函数 D (GGX/Trowbridge-Reitz) =====
+    # ===== 2. 法线分布函数 D (GGX) =====
     alpha = roughness ** 2
     alpha2 = alpha ** 2
     denom = NdotH ** 2 * (alpha2 - 1.0) + 1.0
-    D = alpha2 / (math.pi * denom ** 2 + 1e-8)  # (N, 1)
+    D = alpha2 / (math.pi * denom ** 2 + 1e-8)
     
-    # ===== 3. 几何遮蔽函数 G (Smith-GGX) =====
-    def smith_g1(NdotX, alpha):
-        k = alpha / 2.0
-        return NdotX / (NdotX * (1.0 - k) + k + 1e-8)
-    
-    G = smith_g1(NdotV, alpha) * smith_g1(NdotL, alpha)  # (N, 1)
+    # ===== 3. 几何遮蔽函数 G (Smith-GGX，简化版) =====
+    k = alpha / 2.0
+    G_V = NdotV / (NdotV * (1.0 - k) + k + 1e-8)
+    G_L = NdotL / (NdotL * (1.0 - k) + k + 1e-8)
+    G = G_V * G_L
     
     # ===== 4. 菲涅尔项 F (Schlick近似) =====
-    # F0: 0度入射的反射率
     F0 = torch.lerp(
-        torch.full_like(albedo, 0.04),  # 非金属 ~4%
-        albedo,                          # 金属用albedo作为F0
+        torch.full_like(albedo, 0.04),
+        albedo,
         metallic
-    )  # (N, 3)
-    
-    F = F0 + (1.0 - F0) * torch.pow(1.0 - VdotH, 5.0)  # (N, 3)
+    )
+    F = F0 + (1.0 - F0) * torch.pow(1.0 - VdotH, 5.0)
     
     # ===== 5. Cook-Torrance镜面项 =====
-    numerator = D * G * F  # (N, 3)
+    numerator = D * G * F
     denominator = 4.0 * NdotV * NdotL + 1e-8
-    specular = numerator / denominator  # (N, 3)
-    
-    # ===== 6. 乘以光照强度和Lambert余弦 =====
-    specular = specular * light_intensity * NdotL
+    specular = (numerator / denominator) * light_intensity * NdotL
     
     return specular
 
@@ -99,7 +93,7 @@ def get_dominant_light_direction(env_sh):
 
 def sample_env_for_specular(env_sh, reflect_dir, roughness):
     """
-    根据粗糙度从环境光采样镜面反射
+    根据粗糙度从环境光采样镜面反射（优化版）
     
     参数:
         env_sh: (N, 3, K) 环境光球谐系数
@@ -111,20 +105,21 @@ def sample_env_for_specular(env_sh, reflect_dir, roughness):
     """
     from utils.sh_utils import eval_sh
     
-    # 粗糙度越大，使用越低阶的球谐（模糊效果）
-    # roughness=0 -> degree=4, roughness=1 -> degree=0
-    degree = 4 - int(roughness.mean().item() * 4)
-    degree = max(0, min(4, degree))
+    # ⭐ 简化：固定使用2阶球谐（节省显存）
+    degree = 2
     
     # 从环境光采样
     env_specular = torch.relu(eval_sh(degree, env_sh, reflect_dir))
+    
+    # 根据粗糙度调整强度（粗糙表面镜面反射弱）
+    env_specular = env_specular * (1.0 - roughness * 0.5)
     
     return env_specular
 
 
 def compute_material_regularization(gaussians, opt):
     """
-    计算材质正则化损失
+    计算材质正则化损失（优化版，减少显存占用）
     
     参数:
         gaussians: GaussianModel
@@ -136,55 +131,54 @@ def compute_material_regularization(gaussians, opt):
     losses = {}
     
     # ===== 1. 粗糙度平滑正则化 =====
-    # 相邻高斯的粗糙度应该相似
-    roughness = gaussians.get_roughness  # (N, 1)
-    positions = gaussians.get_xyz  # (N, 3)
-    
-    # 简化版：计算随机采样点对的粗糙度差异
-    N = positions.shape[0]
-    if N > 1000:
-        # 随机采样1000个点
-        indices = torch.randperm(N, device=positions.device)[:1000]
-        sample_pos = positions[indices]
-        sample_rough = roughness[indices]
+    if opt.roughness_smooth_weight > 0:
+        roughness = gaussians.get_roughness  # (N, 1)
+        positions = gaussians.get_xyz  # (N, 3)
         
-        # 找最近邻
-        distances = torch.cdist(sample_pos, positions)  # (1000, N)
-        nearest_idx = distances.topk(k=5, dim=1, largest=False)[1]  # (1000, 5)
-        
-        # 计算粗糙度差异
-        nearest_rough = roughness[nearest_idx]  # (1000, 5, 1)
-        rough_diff = (sample_rough.unsqueeze(1) - nearest_rough) ** 2
-        losses['roughness_smooth'] = opt.roughness_smooth_weight * rough_diff.mean()
+        N = positions.shape[0]
+        if N > 500:  # ⭐ 减少采样数量（从1000降到500）
+            indices = torch.randperm(N, device=positions.device)[:500]
+            sample_pos = positions[indices]
+            sample_rough = roughness[indices]
+            
+            # 找最近邻（减少邻居数量）
+            distances = torch.cdist(sample_pos, positions)  # (500, N)
+            nearest_idx = distances.topk(k=3, dim=1, largest=False)[1]  # ⭐ 从5降到3
+            
+            nearest_rough = roughness[nearest_idx]  # (500, 3, 1)
+            rough_diff = (sample_rough.unsqueeze(1) - nearest_rough) ** 2
+            losses['roughness_smooth'] = opt.roughness_smooth_weight * rough_diff.mean()
+        else:
+            losses['roughness_smooth'] = torch.tensor(0.0, device=positions.device)
     else:
-        losses['roughness_smooth'] = torch.tensor(0.0, device=positions.device)
+        losses['roughness_smooth'] = torch.tensor(0.0, device='cuda')
     
     # ===== 2. 金属度二值化正则化 =====
-    # 鼓励金属度接近0或1
-    metallic = gaussians.get_metallic  # (N, 1)
-    losses['metallic_binary'] = opt.metallic_binary_weight * torch.mean(metallic * (1.0 - metallic))
+    if opt.metallic_binary_weight > 0:
+        metallic = gaussians.get_metallic  # (N, 1)
+        losses['metallic_binary'] = opt.metallic_binary_weight * torch.mean(metallic * (1.0 - metallic))
+    else:
+        losses['metallic_binary'] = torch.tensor(0.0, device='cuda')
     
     # ===== 3. 光探针平滑正则化 =====
-    # 相邻探针的环境光应该相似
-    probe_positions = gaussians.probe_positions  # (K, 3)
-    probe_env_sh = gaussians.probe_env_sh  # (K, 3, 25)
-    
-    K = probe_positions.shape[0]
-    if K > 1:
-        # 计算探针之间的距离
-        probe_distances = torch.cdist(probe_positions, probe_positions)  # (K, K)
+    if opt.probe_smooth_weight > 0:
+        probe_positions = gaussians.probe_positions  # (K, 3)
+        probe_env_sh = gaussians.probe_env_sh  # (K, 3, 9)
         
-        # 找相邻探针（距离小于阈值）
-        threshold = (probe_positions.max() - probe_positions.min()) / 3.0
-        neighbors = (probe_distances < threshold).float()  # (K, K)
-        neighbors = neighbors - torch.eye(K, device=neighbors.device)  # 去掉自己
-        
-        # 计算相邻探针的环境光差异
-        env_diff = probe_env_sh.unsqueeze(0) - probe_env_sh.unsqueeze(1)  # (K, K, 3, 25)
-        env_diff_sq = (env_diff ** 2).sum(dim=[2, 3])  # (K, K)
-        
-        losses['probe_smooth'] = opt.probe_smooth_weight * (env_diff_sq * neighbors).sum() / (neighbors.sum() + 1e-8)
+        K = probe_positions.shape[0]
+        if K > 1:
+            probe_distances = torch.cdist(probe_positions, probe_positions)  # (K, K)
+            threshold = (probe_positions.max() - probe_positions.min()) / 3.0
+            neighbors = (probe_distances < threshold).float()
+            neighbors = neighbors - torch.eye(K, device=neighbors.device)
+            
+            env_diff = probe_env_sh.unsqueeze(0) - probe_env_sh.unsqueeze(1)  # (K, K, 3, 9)
+            env_diff_sq = (env_diff ** 2).sum(dim=[2, 3])  # (K, K)
+            
+            losses['probe_smooth'] = opt.probe_smooth_weight * (env_diff_sq * neighbors).sum() / (neighbors.sum() + 1e-8)
+        else:
+            losses['probe_smooth'] = torch.tensor(0.0, device=probe_positions.device)
     else:
-        losses['probe_smooth'] = torch.tensor(0.0, device=probe_positions.device)
+        losses['probe_smooth'] = torch.tensor(0.0, device='cuda')
     
     return losses

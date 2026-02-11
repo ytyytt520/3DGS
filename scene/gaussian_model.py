@@ -64,7 +64,7 @@ class GaussianModel:
         self._rotation = torch.empty(0) #旋转向量
         self._opacity = torch.empty(0) #不透明度
         self._env_sh = torch.empty(0)
-        self.env_sh_degree = 4  # ⭐ 提高到4阶（25个系数）
+        self.env_sh_degree = 2  # ⭐ 降低到2阶（9个系数）节省显存
         self.env_sh_dc_anchor = 1.0 / C0
         
         # ⭐ 新增：物理材质参数
@@ -72,7 +72,7 @@ class GaussianModel:
         self._metallic = torch.empty(0)   # 金属度
         
         # ⭐ 新增：空间变化环境光（光探针）
-        self.num_probes = 16  # 探针数量
+        self.num_probes = 4  # ⭐ 减少探针数量（从16降到4）节省显存
         self.probe_positions = torch.empty(0)  # 探针位置
         self.probe_env_sh = torch.empty(0)     # 每个探针的环境光
         
@@ -231,12 +231,12 @@ class GaussianModel:
         """
         min_xyz, max_xyz = scene_bounds
         
-        # 在3D网格中均匀放置探针
-        grid_size = int(np.ceil(self.num_probes ** (1/3)))  # 16 -> 3x3x3
+        # 在3D网格中均匀放置探针（4个探针 -> 2x2x1）
+        grid_size = int(np.ceil(self.num_probes ** (1/3)))
         
         x = torch.linspace(min_xyz[0].item(), max_xyz[0].item(), grid_size, device=device)
         y = torch.linspace(min_xyz[1].item(), max_xyz[1].item(), grid_size, device=device)
-        z = torch.linspace(min_xyz[2].item(), max_xyz[2].item(), grid_size, device=device)
+        z = torch.linspace(min_xyz[2].item(), max_xyz[2].item(), max(1, grid_size-1), device=device)
         
         grid_x, grid_y, grid_z = torch.meshgrid(x, y, z, indexing='ij')
         
@@ -249,13 +249,13 @@ class GaussianModel:
         self.probe_positions = nn.Parameter(positions)
         
         # 初始化每个探针的环境光为均匀白光
-        num_coeffs = (self.env_sh_degree + 1) ** 2  # 4阶 = 25个系数
+        num_coeffs = (self.env_sh_degree + 1) ** 2  # ⭐ 2阶 = 9个系数
         probe_env = torch.zeros((self.num_probes, 3, num_coeffs), device=device, dtype=torch.float)
         probe_env[:, :, 0] = self.env_sh_dc_anchor  # DC分量
         
         self.probe_env_sh = nn.Parameter(probe_env)
         
-        print(f"✅ 初始化 {self.num_probes} 个环境光探针，每个探针 {num_coeffs} 个球谐系数")
+        print(f"✅ 初始化 {self.num_probes} 个环境光探针，每个探针 {num_coeffs} 个球谐系数（节省显存模式）")
     
     def get_spatially_varying_env(self, positions):
         """

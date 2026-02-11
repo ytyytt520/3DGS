@@ -105,9 +105,11 @@ class OptimizationParams(ParamGroup):
         self.roughness_lr = 0.005
         self.metallic_lr = 0.005
         self.probe_lr = 0.0001
-        self.roughness_smooth_weight = 0.01
-        self.metallic_binary_weight = 0.01
-        self.probe_smooth_weight = 0.01
+        self.roughness_smooth_weight = 0.0  # ⭐ 禁用以节省显存
+        self.metallic_binary_weight = 0.001  # ⭐ 降低权重
+        self.probe_smooth_weight = 0.0  # ⭐ 禁用以节省显存
+        self.num_probes = 4  # ⭐ 减少探针数量（从16降到4）
+        self.sh_degree_env = 2  # ⭐ 环境光球谐阶数（从4降到2，9系数）
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
